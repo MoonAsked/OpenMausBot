@@ -1,4 +1,4 @@
-import type { WireGroup } from "../../shared/wire.ts";
+import type { GroupResponseMode, WireGroup } from "../../shared/wire.ts";
 import { validateBotCwd } from "../bot-cwd.ts";
 import type { VisibleSet } from "../bot-visibility.ts";
 import type { RequestAuth } from "../request-auth.ts";
@@ -15,6 +15,10 @@ export interface GroupRouteDeps {
   threadStarters: Pick<ThreadStarters, "set">;
   createChannel(value: unknown): GroupRecord;
   publicGroupState(record: GroupRecord): WireGroup;
+}
+
+export function checkedGroupResponseMode(value: unknown): GroupResponseMode | null {
+  return value === "sequential" || value === "parallel" ? value : null;
 }
 
 /** A room's default responder from a request body; null when it is not one, or names a bot outside the room. */
@@ -70,7 +74,7 @@ export function createGroupRoutes(deps: GroupRouteDeps): RouteHandler {
         return json(res, 409, { error: "room setup must be finished before the first message" });
       }
 
-      const patch: Partial<Pick<GroupRecord, "cwd" | "defaultResponder" | "bulletin" | "setupCompletedAt" | "setupSkippedAt">> = {};
+      const patch: Partial<Pick<GroupRecord, "cwd" | "defaultResponder" | "responseMode" | "bulletin" | "setupCompletedAt" | "setupSkippedAt">> = {};
       if (body.action === "complete") {
         const checked = validateBotCwd(body.cwd ?? null);
         if (!checked.ok) return json(res, 400, { error: checked.error });
@@ -78,8 +82,11 @@ export function createGroupRoutes(deps: GroupRouteDeps): RouteHandler {
         if (body.bulletin.length > 12_000) return json(res, 400, { error: "bulletin must be at most 12000 characters" });
         const responder = checkedGroupResponder(body.defaultResponder, group.memberIds);
         if (!responder) return json(res, 400, { error: "invalid default responder" });
+        const responseMode = checkedGroupResponseMode(body.responseMode === undefined ? "sequential" : body.responseMode);
+        if (!responseMode) return json(res, 400, { error: "responseMode must be sequential or parallel" });
         patch.cwd = checked.cwd ?? undefined;
         patch.defaultResponder = responder;
+        patch.responseMode = responseMode;
         patch.bulletin = body.bulletin;
         patch.setupCompletedAt = Date.now();
       } else {

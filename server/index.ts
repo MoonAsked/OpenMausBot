@@ -16,6 +16,7 @@ import { compactBudget, compactionReading, contextWindowFor, shouldCompact } fro
 import { autoCompactWindow } from "./drivers/claude.ts";
 import { RoomContextTracker, roomResetNote } from "./room-context.ts";
 import { createRoomTranscript, GROUP_CONTEXT_MESSAGES } from "./host/room-transcript.ts";
+import { createParallelReplies, PARALLEL_REPLY_RESTARTED, settleInterruptedParallelReplies } from "./host/room-parallel-replies.ts";
 import { createRoomSessions } from "./host/room-sessions.ts";
 import { LentComputers, provenRequestPerson, SharedComputers, sharedComputerOperation } from "./shared-computers.ts"; import { lentScreenResult } from "./lent-screen-guidance.ts"; import { DeviceLinks } from "./device-links.ts";
 import { cloudHomeLendingRefusal, createCloudRoutineAuthors, ownerOnlyConversation, type CloudLendingTurn } from "./cloud-lending.ts"; import { assertRoomFolder } from "./room-folder.ts"; import { cloudConnectedAppsBrokerUrl, startCloudHomeConnectedApps, stopCloudHomeConnectedApps } from "./cloud-connected-apps.ts"; import { createTeamConnectionsHost } from "./host/team-connections-host.ts"; import { createTeamConnectionRoutes } from "./routes/team-connections.ts";
@@ -602,7 +603,7 @@ import { createSignInCardRoutes } from "./routes/sign-in-cards.ts";
 import { createInternalEscalateRoutes } from "./routes/internal-escalate.ts";
 import { createInternalChiefTeamRoutes } from "./routes/internal-chief-team.ts";
 import { createRoomHoldRoutes } from "./routes/room-holds.ts";
-import { checkedGroupResponder, createGroupRoutes } from "./routes/groups.ts";
+import { checkedGroupResponder, checkedGroupResponseMode, createGroupRoutes } from "./routes/groups.ts";
 import { createChannelRoutes } from "./routes/channels.ts";
 import { createTaskRoutes } from "./routes/tasks.ts";
 import { createTeamRoutes } from "./routes/teams.ts";
@@ -3668,6 +3669,7 @@ type GroupTurnOperation = {
   providerHandshakePending: boolean;
   queuedQueueIds?: string[];
   line?: RoomRoundLine;
+  parallelLanes?: Map<string, { botId: string; threadId: string }>;
   goalRun?: {
     runId: string;
     cardMessageId: string;
@@ -3805,13 +3807,13 @@ function createChannel(value: unknown): GroupRecord {
     }
   }
   let setup:
-    | { bulletin: string; defaultResponder: GroupDefaultResponder; completed: true }
+    | { bulletin: string; defaultResponder: GroupDefaultResponder; responseMode?: GroupRecord["responseMode"]; completed: true }
     | undefined;
   if (body.setup !== undefined) {
     if (!body.setup || typeof body.setup !== "object" || Array.isArray(body.setup)) {
       throw Object.assign(new Error("setup must be an object"), { status: 400 });
     }
-    const requested = body.setup as { bulletin?: unknown; defaultResponder?: unknown };
+    const requested = body.setup as { bulletin?: unknown; defaultResponder?: unknown; responseMode?: unknown };
     if (typeof requested.bulletin !== "string") {
       throw Object.assign(new Error("setup.bulletin must be a string"), { status: 400 });
     }
@@ -3820,7 +3822,9 @@ function createChannel(value: unknown): GroupRecord {
     }
     const responder = checkedGroupResponder(requested.defaultResponder, memberIds);
     if (!responder) throw Object.assign(new Error("invalid setup.defaultResponder"), { status: 400 });
-    setup = { bulletin: requested.bulletin, defaultResponder: responder, completed: true };
+    const responseMode = requested.responseMode === undefined ? "sequential" : checkedGroupResponseMode(requested.responseMode);
+    if (!responseMode) throw Object.assign(new Error("invalid setup.responseMode"), { status: 400 });
+    setup = { bulletin: requested.bulletin, defaultResponder: responder, responseMode, completed: true };
   }
   return store.createGroup(name, memberIds, false, section, setup ?? (deciderReady(cfg, "roomRouting") ? { defaultResponder: { kind: "auto" } } : undefined));
 }
@@ -3838,7 +3842,7 @@ function updateChannel(groupId: string, value: unknown): GroupRecord {
   }
   if (
     channelTaskBlocked(existing) &&
-    (body.memberIds !== undefined || body.defaultResponder !== undefined || body.bulletin !== undefined)
+    (body.memberIds !== undefined || body.defaultResponder !== undefined || body.bulletin !== undefined || body.responseMode !== undefined)
   ) {
     throw Object.assign(new Error("this channel is working or waiting on you — finish that turn first"), { status: 409 });
   }
@@ -3892,6 +3896,12 @@ function updateChannel(groupId: string, value: unknown): GroupRecord {
       throw Object.assign(new Error("pause or reassign this room's team-goal routine before removing its lead"), { status: 409 });
     }
     patch.memberIds = roster.memberIds;
+  }
+  if (body.responseMode !== undefined) {
+    if (existing.dm) throw Object.assign(new Error("direct-message channels cannot change response mode"), { status: 400 });
+    const responseMode = checkedGroupResponseMode(body.responseMode);
+    if (!responseMode) throw Object.assign(new Error("invalid responseMode"), { status: 400 });
+    patch.responseMode = responseMode;
   }
   if (body.defaultResponder !== undefined) {
     const memberIds = (patch.memberIds as string[] | undefined) ?? existing.memberIds;
@@ -4034,7 +4044,7 @@ function runRoomNode(node: HandoffView, group: GroupRecord, bot: BotRecord, sign
       if (operation.cancelled) return;
       const problem = node.parentId ? roomHandoffProblem(node, parent) : roomRootProblem(node);
       if (problem) throw new Error(problem);
-      const available = await waitForChatRoomMember(operation, node.threadId, bot);
+      const available = await parallelReplies.waitForChatRoomMember(operation, node.threadId, bot);
       if (available !== "run") { result.outcome = "cancelled"; return; }
       await turn(operation, result, { id: node.id, settle: finish });
     });
@@ -4051,6 +4061,9 @@ function runRoomNode(node: HandoffView, group: GroupRecord, bot: BotRecord, sign
 }
 
 function runRoomRootTurn(node: HandoffView, group: GroupRecord, bot: BotRecord, signal: AbortSignal, composed: ComposedTurn): Promise<HostTurnResult> {
+  if (composed.turn === "rerun" && store.groupTaskByThread(group.id, node.threadId)?.parallelReply) {
+    return Promise.resolve({ ok: false, text: PARALLEL_REPLY_RESTARTED });
+  }
   if (composed.turn === "rerun" && node.goalRunId && !goalRunLive(group.id, node.threadId, node.goalRunId)) {
     return Promise.resolve({ ok: false, text: "The goal run this step belonged to ended with the restart." });
   }
@@ -4061,7 +4074,7 @@ function runRoomRootTurn(node: HandoffView, group: GroupRecord, bot: BotRecord, 
   return runRoomNode(node, group, bot, signal, undefined, (operation, result, coordination) =>
     runGroupMemberTurn(group.id, node.threadId, bot.id, 0, new Set(), composed.text, error => { result.stopReason = error; }, () => operation.cancelled,
       () => groupProviderHandshakeStarted(operation), () => groupProviderHandshakeSettled(operation), undefined,
-      { roomHandoffId: node.id, systemInstructions: "", followMentions: true, result, coordination, ...(node.goalRunId ? { goalRunId: node.goalRunId } : {}) }, operation));
+      { roomHandoffId: node.id, systemInstructions: "", followMentions: !store.groupTaskByThread(group.id, node.threadId)?.parallelReply, result, coordination, ...(node.goalRunId ? { goalRunId: node.goalRunId } : {}) }, operation));
 }
 
 function runRootTurn(node: HandoffView, bot: BotRecord, signal: AbortSignal, composed: ComposedTurn): Promise<HostTurnResult> {
@@ -4325,6 +4338,20 @@ const coordinator: Coordinator = createCoordinator({
     },
   },
 });
+
+const parallelReplies = createParallelReplies({
+  store, broadcast, coordinator, bus, shouldIgnoreProviderEvent, userNameFor, publicGroupState,
+  speakersOf: threadId => groupSpeakers.get(threadId), operations: groupId => groupTurnOperations.get(groupId) ?? [],
+  turnTriggerFor: threadId => turnTriggers.get(threadId),
+  copyTurnTrigger: (from, to) => { const trigger = turnTriggers.get(from); if (trigger) turnTriggers.set(to, trigger); },
+  waitCapMs: () => GROUP_GOAL_WAIT_MAX_MS,
+  beginGroupTurnOperation, finishGroupTurnOperation, waitForGroupMemberBot,
+  handshakeStarted: groupProviderHandshakeStarted, handshakeSettled: groupProviderHandshakeSettled,
+  runMemberTurn: ({ groupId, threadId, botId, onError, cancelled, operation, systemInstructions, onClaimed, contextMessages, contextUserName, result }) =>
+    runGroupMemberTurn(groupId, threadId, botId, 0, new Set(), undefined, onError, cancelled,
+      () => groupProviderHandshakeStarted(operation), () => groupProviderHandshakeSettled(operation), { claimed: true },
+      { systemInstructions, followMentions: false, result, contextMessages, contextUserName, onClaimed }, operation),
+});
 threadsAwaitingTeammates = () => coordinator.awaitingTeammateThreads();
 const groupUsageReader = new GroupUsageReader(DATA_DIR);
 try { groupUsageReader.refresh(); } catch {}
@@ -4352,10 +4379,12 @@ function publicGroupState(record: GroupRecord): WireGroup {
       ...task,
       working,
       busyBotId: speaker?.botId ?? null,
+      activeResponders: parallelReplies.respondersOf(record.id, task.threadId),
     };
   });
   const currentSpeaker = groupSpeakers.get(group.threadId);
   const activeWorking = groupThreadIsWorking(record.id, group.threadId);
+  const activeResponders = parallelReplies.respondersOf(record.id, group.threadId);
   return {
     ...group,
     tasks: record.dm ? undefined : tasks,
@@ -4364,7 +4393,8 @@ function publicGroupState(record: GroupRecord): WireGroup {
     turnTimeoutMinutes: record.turnTimeoutMinutes ?? null,
     usage: usage ?? null,
     memberContext: roomMemberContexts.forThread(group.threadId) ?? null,
-    busyBotId: currentSpeaker?.botId ?? (activeWorking ? record.busyBotId : null),
+    activeResponders,
+    busyBotId: activeResponders.length ? null : currentSpeaker?.botId ?? (activeWorking ? record.busyBotId : null),
     ...(currentSpeaker?.since ? { turnStartedAt: currentSpeaker.since } : {}),
     working: groupIsWorking(record) || openHandoffs.length > 0,
     // Always present, so a frame with nobody waiting clears the last one.
@@ -4672,57 +4702,6 @@ function clearHeldReplay(groupId: string, botId: string, messageIds: readonly st
   store.patchGroup(groupId, { heldMessages });
 }
 
-async function waitForChatRoomMember(
-  operation: GroupTurnOperation,
-  threadId: string,
-  bot: BotRecord,
-): Promise<"run" | "skip" | "stop"> {
-  const waitTool = {
-    name: `${bot.name} is finishing another conversation — will reply here when free`,
-    spoken: `${bot.name} is finishing another conversation`,
-  };
-  let waitChip: Message | undefined;
-  const availability = await waitForGroupMemberBot(bot, operation, () => {
-    waitChip = store.appendMessage(threadId, {
-      role: "bot",
-      kind: "activity",
-      from: { botId: bot.id, name: bot.name, color: bot.color },
-      tool: waitTool,
-    });
-  });
-  switch (availability) {
-    case "ready":
-      if (waitChip) store.patchMessage(threadId, waitChip.id, { tool: { ...waitTool, ok: true } });
-      operation.botIds.add(bot.id);
-      return "run";
-    case "cancelled":
-      return "stop";
-    case "unavailable":
-      store.appendMessage(threadId, {
-        role: "bot",
-        kind: "activity",
-        from: { botId: bot.id, name: bot.name, color: bot.color },
-        tool: { name: `${bot.name} is no longer available — skipped this round`, ok: false },
-      });
-      return "skip";
-    case "timed_out": {
-      const minutes = Math.max(1, Math.round(GROUP_GOAL_WAIT_MAX_MS / 60_000));
-      const name =
-        `${bot.name} stayed busy in another conversation for ${minutes} minute${minutes === 1 ? "" : "s"} — skipped this round`;
-      if (waitChip) store.patchMessage(threadId, waitChip.id, { tool: { name, ok: false } });
-      else {
-        store.appendMessage(threadId, {
-          role: "bot",
-          kind: "activity",
-          from: { botId: bot.id, name: bot.name, color: bot.color },
-          tool: { name, ok: false },
-        });
-      }
-      return "skip";
-    }
-  }
-}
-
 function newestPeerActivityAt(botId: string): number {
   let newest = 0;
   for (const task of store.tasks(botId)) {
@@ -4761,6 +4740,9 @@ function cancelGroupTurnOperations(
     if (operation.threadId !== threadId) continue;
     operation.cancelled = true;
     operation.cancellation.abort();
+    for (const lane of operation.parallelLanes?.values() ?? []) {
+      void interruptRoutineGroupGoal(groupId, lane.threadId, outcome);
+    }
     finishGroupGoalRun(groupId, operation, outcome.status, outcome.detail);
     if (operation.providerHandshakePending) {
       markCancelledProviderHandshake(operation.threadId, `group:${operation.id}`);
@@ -9964,6 +9946,8 @@ type GroupTurnOrchestration = {
   onTurnStarted?: (turnId: string) => void;
   coordination?: { id: string; settle: (outcome: HostTurnResult) => void };
   goalRunId?: string;
+  contextMessages?: Message[];
+  contextUserName?: PersonName;
 };
 
 function teammateReportContext(requestId: string, readerBotId?: string): string {
@@ -10092,7 +10076,7 @@ async function runClaimedGroupMemberTurn(
   const preparedSelection = { ...bot.modelSelection };
   const preparedComposio = bot.composio;
   const instance = registry.get(bot.modelSelection.instanceId);
-  const userName = userNameFor(threadId);
+  const userName = orchestration?.contextUserName ?? userNameFor(threadId);
   if (providerInstancesChanging.has(bot.modelSelection.instanceId)) {
     onDispatchError?.(`${bot.name}'s provider account is being updated — try again shortly`);
     return true;
@@ -10177,7 +10161,8 @@ async function runClaimedGroupMemberTurn(
   if (instance.adapter.capabilities.hooks === true && hooksEnabled()) {
     integrations.hooks = hooksIntegration(bot.id, threadId, internalGeneration);
   }
-  const latestUser = [...store.activePath(threadId)].reverse().find(
+  const contextMessages = orchestration?.contextMessages ?? store.activePath(threadId);
+  const latestUser = [...contextMessages].reverse().find(
     (message) => message.role === "user" && message.kind === "text" && message.text,
   );
   const usesNativeImageInput = instance.adapter.capabilities.nativeImageInput === true;
@@ -10186,7 +10171,7 @@ async function runClaimedGroupMemberTurn(
   const burstOverrides: Array<{ messageId: string; text: string }> = [];
   const burstImages: ReturnType<typeof extractTurnImages>["images"] = [];
   if (usesNativeImageInput && !cardContinuation) {
-    for (const message of store.activePath(threadId)) {
+    for (const message of contextMessages) {
       if (message.role !== "user" || message.kind !== "text" || !message.text) continue;
       if (!message.queueId || !burstIds.has(message.queueId)) continue;
       const resolved = extractTurnImages(message.text);
@@ -10199,7 +10184,10 @@ async function runClaimedGroupMemberTurn(
   const resolvedLatestImages = latestUser?.text && !cardContinuation && !latestInBurst
     ? extractTurnImages(latestUser.text)
     : { text: latestUser?.text ?? "", images: [] };
-  const roomWindow = roomTranscript.window(
+  const transcript = orchestration?.contextMessages
+    ? createRoomTranscript({ store: { messagesFor: () => contextMessages }, teammateReportContext })
+    : roomTranscript;
+  const roomWindow = transcript.window(
     threadId,
     userName,
     usesNativeImageInput && latestUser
@@ -10960,7 +10948,7 @@ async function runClaimedGroupMemberTurn(
       if (isCancelled?.()) return false;
       if (spoken.has(next.id)) continue;
       if (operation) {
-        const verdict = await waitForChatRoomMember(operation, threadId, next);
+        const verdict = await parallelReplies.waitForChatRoomMember(operation, threadId, next);
         if (verdict === "stop") return false;
         if (verdict === "skip") {
           spoken.add(next.id);
@@ -11393,7 +11381,7 @@ function startGroupTurn(
     throw Object.assign(new Error("the selected goal coordinator is not an active room member"), { status: 409 });
   }
   // Read the room before this message is appended just below.
-  const autoCandidate = !group.dm && channelMode === "chat" && group.defaultResponder.kind === "auto" &&
+  const autoCandidate = !group.dm && !store.groupTaskByThread(groupId, threadId)?.parallelReply && channelMode === "chat" && group.defaultResponder.kind === "auto" &&
     deciderReady(cfg, "roomRouting");
   const historyBeforeSend = autoCandidate
     ? (() => {
@@ -11461,7 +11449,10 @@ function startGroupTurn(
       },
     });
   }
-  let responders = roomResponders(text, members, group.defaultResponder);
+  const parallelReply = store.groupTaskByThread(groupId, threadId)?.parallelReply;
+  const defaultResponder = parallelReply && group.memberIds.includes(parallelReply.botId)
+    ? { kind: "member" as const, botId: parallelReply.botId } : group.defaultResponder;
+  let responders = roomResponders(text, members, defaultResponder);
   if (!group.dm) {
     const addressed = stopWordPlacement(text) === "adjacent" ? undefined : message.id;
     for (const held of responders.filter(isHeld)) noteHeldSkip(group.id, threadId, held, addressed);
@@ -11592,6 +11583,10 @@ function startGroupTurn(
         for (const responder of round) operation.botIds.add(responder.id);
         if (round[0]) startTitle(round[0]);
       }
+      if (!group.dm && group.responseMode === "parallel" && round.length > 1) {
+        await parallelReplies.runRound(groupId, threadId, round, operation, message, routedBy);
+        return;
+      }
       const spoken = new Set<string>();
       const skillAuthoringClaim = { claimed: false };
       if (round.length > 1) operation.line = { pending: round.map(responder => responder.id) };
@@ -11603,7 +11598,7 @@ function startGroupTurn(
       for (const responder of round) {
         if (operation.cancelled) break;
         if (spoken.has(responder.id)) continue;
-        const verdict = await waitForChatRoomMember(operation, threadId, responder);
+        const verdict = await parallelReplies.waitForChatRoomMember(operation, threadId, responder);
         if (verdict === "stop") break;
         if (verdict === "skip") { spoken.add(responder.id); advanceLine(undefined); continue; }
         const stamp = routedBy ? { botId: responder.id, routedBy } : undefined;
@@ -16460,6 +16455,9 @@ for (const row of chatFollowups()) {
 }
 restoreSteeredMessages();
 restoreChannelMessages();
+for (const interrupted of settleInterruptedParallelReplies(store)) {
+  coordinator.cancelRoom(interrupted.groupId, interrupted.threadId, PARALLEL_REPLY_RESTARTED, "failed");
+}
 
 {
   let movedAutoPins = 0;

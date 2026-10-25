@@ -782,6 +782,14 @@ export type GroupDefaultResponder =
   | { kind: "mentions" }
   | { kind: "auto"; fallbackBotId?: string };
 
+export type GroupResponseMode = "sequential" | "parallel";
+
+export interface GroupActiveResponder {
+  botId: string;
+  threadId: string;
+  state: "queued" | "running" | "waiting-on-you";
+}
+
 /** One independent conversation inside a user-created channel. */
 export interface GroupTask {
   threadId: string;
@@ -804,6 +812,10 @@ export interface GroupTask {
   working?: boolean;
   /** The member bot currently speaking or generating in this thread, if any. */
   busyBotId?: string | null;
+  /** Transient member replies belonging to this conversation's parallel round. */
+  activeResponders?: GroupActiveResponder[];
+  /** The parent message and member whose independent reply this thread contains. */
+  parallelReply?: { parentThreadId: string; messageId: string; botId: string };
 }
 
 /** A room as a client may see it: the record plus the computed working flag. */
@@ -822,6 +834,8 @@ export interface WireGroup {
   name: string;
   memberIds: string[];
   defaultResponder: GroupDefaultResponder;
+  /** How multiple addressed members answer a chat message. Absent means sequential. */
+  responseMode?: GroupResponseMode;
   /** The room's shared instructions. */
   bulletin: string;
   /** Short one-line description shown under the room name; distinct from
@@ -837,6 +851,8 @@ export interface WireGroup {
   dm?: boolean;
   /** transient: the member currently running a turn. */
   busyBotId?: string | null;
+  /** Transient member replies belonging to the active conversation's parallel round. */
+  activeResponders?: GroupActiveResponder[];
   /** transient: when the busy member's turn started; never persisted. */
   turnStartedAt?: number;
   /** the room's shared desk; absent = each member's own default. */

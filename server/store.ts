@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, readFileSync, mkdirSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
+import { migrateParallelGroupState } from "./host/room-parallel-replies.ts";
 import { writeFileAtomic, writeFileAtomicIfChanged } from "./atomic.ts";
 import { commitRegistryChange, keptRevocation, saveRegistryFor } from "./registry-save.ts";
 import { parseToolScope, toolScopeWidens } from "../shared/tool-scope.ts";
@@ -493,6 +494,7 @@ export class Store {
     for (const g of this.groups) {
       g.busyBotId = null;
       delete g.turnStartedAt;
+      if (migrateParallelGroupState(g)) groupsMigrated = true;
       if (botsLoaded && !g.dm && g.memberIds.some((id) => !botIds.has(id))) {
         g.memberIds = g.memberIds.filter((id) => botIds.has(id));
         groupsMigrated = true;
@@ -722,9 +724,9 @@ export class Store {
 
   private saveGroups(groups: GroupRecord[] = this.groups, registerSections = true) {
     if (registerSections) this.rememberSections(groups.map((group) => group.section));
-    writeFileAtomicIfChanged(GROUPS_FILE, JSON.stringify(groups.map(({ busyBotId: _busyBotId, turnStartedAt: _turnStartedAt, ...g }) => ({
+    writeFileAtomicIfChanged(GROUPS_FILE, JSON.stringify(groups.map(({ busyBotId: _busyBotId, turnStartedAt: _turnStartedAt, activeResponders: _activeResponders, ...g }) => ({
       ...g,
-      ...(g.tasks ? { tasks: g.tasks.map((task) => persistedPin(task)) } : {}),
+      ...(g.tasks ? { tasks: g.tasks.map(({ activeResponders: _activeResponders, ...task }) => persistedPin(task)) } : {}),
     })), null, 2), { mode: 0o600 });
   }
 
@@ -867,6 +869,7 @@ export class Store {
     setup?: {
       bulletin?: string;
       defaultResponder?: GroupDefaultResponder;
+      responseMode?: GroupRecord["responseMode"];
       completed?: boolean; id?: string; threadId?: string;
     },
   ): GroupRecord {
@@ -881,6 +884,7 @@ export class Store {
       defaultResponder: dm
         ? { kind: "mentions" }
         : normalizeGroupDefaultResponder(setup?.defaultResponder, memberIds, false),
+      responseMode: !dm && setup?.responseMode === "parallel" ? "parallel" : "sequential",
       bulletin: setup?.bulletin ?? "",
       unread: false,
       createdAt,
@@ -905,7 +909,7 @@ export class Store {
     );
   }
 
-  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "description" | "unread" | "lastReadMessageId" | "busyBotId" | "cwd" | "pinnedMessageId" | "section" | "setupCompletedAt" | "setupSkippedAt" | "audienceFloor" | "installedPackage" | "turnTimeoutMinutes" | "holds" | "heldMessages">>): GroupRecord | null {
+  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "responseMode" | "bulletin" | "description" | "unread" | "lastReadMessageId" | "busyBotId" | "cwd" | "pinnedMessageId" | "section" | "setupCompletedAt" | "setupSkippedAt" | "audienceFloor" | "installedPackage" | "turnTimeoutMinutes" | "holds" | "heldMessages">>): GroupRecord | null {
     const group = this.group(id);
     if (!group) return null;
     if (Object.prototype.hasOwnProperty.call(patch, "section")) {
@@ -927,6 +931,7 @@ export class Store {
         if (active) active.pinnedMessageId = stored.pinnedMessageId;
       }
       group.defaultResponder = normalizeGroupDefaultResponder(group.defaultResponder, group.memberIds, Boolean(group.dm));
+      group.responseMode = !group.dm && group.responseMode === "parallel" ? "parallel" : "sequential";
       if (Object.prototype.hasOwnProperty.call(stored, "memberIds")) pruneRoomHolds(group);
     });
     this.emit({ type: "group", groupId: group.id });
@@ -1022,15 +1027,17 @@ export class Store {
     return group.tasks?.find((task) => task.threadId === threadId);
   }
 
-  createGroupTask(groupId: string, title?: string, activate = true): GroupTaskRecord | null {
+  createGroupTask(groupId: string, title?: string, activate = true, parallelReply?: GroupTaskRecord["parallelReply"]): GroupTaskRecord | null {
     const group = this.group(groupId);
     if (!group || group.dm) return null;
+    const parent = parallelReply ? this.groupTaskByThread(groupId, parallelReply.parentThreadId) : undefined;
     const createdAt = Date.now();
     const task: GroupTaskRecord = {
       threadId: newId(),
       title: title?.trim().slice(0, 80) || UNTITLED_TASK,
       createdAt,
       updatedAt: createdAt,
+      ...(parallelReply ? { parallelReply: { ...parallelReply }, ...(parent?.pinnedCwd !== undefined ? { pinnedCwd: parent.pinnedCwd } : {}), ...(parent?.turnTimeoutMinutes !== undefined ? { turnTimeoutMinutes: parent.turnTimeoutMinutes } : {}) } : {}),
     };
     this.commitGroupChange(group, "the new thread", () => {
       group.tasks = [task, ...(group.tasks ?? [])];

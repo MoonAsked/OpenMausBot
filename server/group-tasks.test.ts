@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -22,6 +22,45 @@ afterEach(async () => {
 });
 
 describe("channel tasks", () => {
+  it("preserves the chosen reply mode across restarts and defaults legacy rooms to sequential", async () => {
+    const { store, Store } = await freshStore();
+    const bot = store.createBot();
+    const channel = store.createGroup("Product", [bot.id]);
+    expect(channel.responseMode).toBe("sequential");
+    store.patchGroup(channel.id, { responseMode: "parallel" });
+    expect(new Store(() => ({ instanceId: "claude", model: "m" })).group(channel.id)?.responseMode).toBe("parallel");
+    const { DATA_DIR } = await import("./config.ts");
+    const path = join(DATA_DIR, "groups.json");
+    const saved = JSON.parse(readFileSync(path, "utf8"));
+    delete saved[0].responseMode;
+    writeFileSync(path, JSON.stringify(saved));
+    expect(new Store(() => ({ instanceId: "claude", model: "m" })).group(channel.id)?.responseMode).toBe("sequential");
+  });
+
+  it("retains parallel reply ownership but does not persist running member state", async () => {
+    const { store, Store } = await freshStore();
+    const bot = store.createBot();
+    const channel = store.createGroup("Product", [bot.id]);
+    const parentThreadId = channel.threadId;
+    store.patchGroup(channel.id, { cwd: "/tmp/parallel-room" });
+    store.pinGroupCwd(channel.id, parentThreadId);
+    store.patchGroupTask(channel.id, parentThreadId, { turnTimeoutMinutes: 17 });
+    const parallelReply = { parentThreadId, messageId: "round-message", botId: bot.id };
+    const lane = store.createGroupTask(channel.id, "Member reply", false, parallelReply)!;
+    expect(lane).toMatchObject({ pinnedCwd: "/tmp/parallel-room", turnTimeoutMinutes: 17 });
+    const activeResponders = [{ botId: bot.id, threadId: lane.threadId, state: "running" as const }];
+    channel.activeResponders = activeResponders;
+    store.groupTaskByThread(channel.id, parentThreadId)!.activeResponders = activeResponders;
+    store.patchGroup(channel.id, { responseMode: "parallel" });
+    const { DATA_DIR } = await import("./config.ts");
+    expect(readFileSync(join(DATA_DIR, "groups.json"), "utf8")).not.toContain("activeResponders");
+    const restored = new Store(() => ({ instanceId: "claude", model: "m" }));
+    expect(restored.group(channel.id)?.threadId).toBe(parentThreadId);
+    expect(restored.groupTaskByThread(channel.id, lane.threadId)?.parallelReply).toEqual(parallelReply);
+    expect(restored.group(channel.id)?.activeResponders).toBeUndefined();
+    expect(restored.groupTaskByThread(channel.id, parentThreadId)?.activeResponders).toBeUndefined();
+  });
+
   it("gives a user-created channel one task while DMs stay single-threaded", async () => {
     const { store, UNTITLED_TASK } = await freshStore();
     const bot = store.createBot();
