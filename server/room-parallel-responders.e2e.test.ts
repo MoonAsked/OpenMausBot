@@ -237,6 +237,101 @@ describe.skipIf(process.platform === "win32")("parallel room responders", () => 
     }
   }, 90_000);
 
+  it("broadcasts to every member when the room only answers mentions and nobody is named", async () => {
+    const f = await launch();
+    try {
+      const xena = await f.newBot("Xena");
+      const yuri = await f.newBot("Yuri");
+      const pair = await f.newRoom("Broadcast unaddressed", [xena, yuri], "broadcast", { kind: "mentions" });
+      f.play(xena.id, "happy", { FAKE_CLAUDE_REPLIES: JSON.stringify(["[SKIP]"]) });
+      f.play(yuri.id, "happy", { FAKE_CLAUDE_REPLIES: JSON.stringify(["YURI_ANSWERED_UNADDRESSED"]) });
+      await f.send(pair, "Nobody is mentioned and this room only answers mentions");
+      await expect.poll(async () => Boolean(f.providerThread(xena.id) && f.providerThread(yuri.id)), POLL).toBe(true);
+      await expect.poll(() => f.replied(pair.threadId, yuri.id, "YURI_ANSWERED_UNADDRESSED"), POLL).toBe(true);
+      await f.idle(pair);
+      const messages = await f.messages(pair.threadId);
+      expect(messages.some((message) => message.from?.botId === xena.id && message.kind === "text" && (message.text ?? "").trim() !== "")).toBe(false);
+      expect(messages.some((message) => message.from?.botId === xena.id && message.tool?.ok === true && (message.tool.name ?? "").includes("passed"))).toBe(true);
+      f.evidence("broadcast-unaddressed", { room: await f.room(pair.id), messages });
+    } finally {
+      await f.close();
+    }
+  }, 90_000);
+
+  it("keeps a member-details follow-up with that member alone in a broadcast room", async () => {
+    const f = await launch();
+    try {
+      const xena = await f.newBot("Xena");
+      const yuri = await f.newBot("Yuri");
+      const pair = await f.newRoom("Broadcast follow-up", [xena, yuri], "broadcast");
+      f.play(xena.id, "happy", { FAKE_CLAUDE_REPLIES: JSON.stringify(["FIRST_ROUND_ANSWER"]) });
+      f.play(yuri.id, "happy", { FAKE_CLAUDE_REPLIES: JSON.stringify(["YURI_FIRST_ROUND"]) });
+      await f.send(pair, "Everyone answers once");
+      await expect.poll(() => f.replied(pair.threadId, xena.id, "FIRST_ROUND_ANSWER"), POLL).toBe(true);
+      await expect.poll(() => f.replied(pair.threadId, yuri.id, "YURI_FIRST_ROUND"), POLL).toBe(true);
+      await f.idle(pair);
+      const lane = (await f.room(pair.id)).tasks?.find(task => task.parallelReply?.botId === xena.id && task.threadId !== pair.threadId);
+      expect(lane?.threadId).toBeTruthy();
+      const laneThread = lane!.threadId!;
+      const before = (await f.room(pair.id)).tasks?.length ?? 0;
+      const follow = await f.send({ id: pair.id, threadId: laneThread }, "Follow up in the member's details");
+      const laneReplies = async () => (await f.messages(laneThread)).filter(message =>
+        message.role === "bot" && message.kind === "text" && message.from?.botId === xena.id);
+      await expect.poll(async () => (await laneReplies()).length >= 2, POLL).toBe(true);
+      await f.idle({ id: pair.id, threadId: laneThread });
+      const room = await f.room(pair.id);
+      expect(room.tasks?.length ?? 0).toBe(before);
+      expect(room.tasks?.filter(task => task.parallelReply?.messageId === follow.message.id) ?? []).toEqual([]);
+      expect((await f.messages(laneThread)).some(message => message.from?.botId === yuri.id)).toBe(false);
+      f.evidence("broadcast-follow-up-stays-single", { room, laneThread });
+    } finally {
+      await f.close();
+    }
+  }, 90_000);
+
+  it("still broadcasts when the default responder is held and nobody is mentioned", async () => {
+    const f = await launch();
+    try {
+      const xena = await f.newBot("Xena");
+      const yuri = await f.newBot("Yuri");
+      const pair = await f.newRoom("Broadcast held default", [xena, yuri], "broadcast", { kind: "member", botId: xena.id });
+      await f.api("POST", `/api/groups/${pair.id}/holds`, { botId: xena.id, held: true });
+      const xenaBefore = f.providerThread(xena.id);
+      f.play(yuri.id, "happy", { FAKE_CLAUDE_REPLIES: JSON.stringify(["YURI_ANSWERED_DESPITE_HELD_DEFAULT"]) });
+      // No mention in the text: the hold on the default responder stays, and the broadcast still reaches everyone else.
+      await f.send(pair, "Nobody in particular is addressed here");
+      await expect.poll(() => f.replied(pair.threadId, yuri.id, "YURI_ANSWERED_DESPITE_HELD_DEFAULT"), POLL).toBe(true);
+      await f.idle(pair);
+      expect(f.providerThread(xena.id)).toBe(xenaBefore);
+      expect(((await f.room(pair.id)).tasks ?? []).some(task => task.parallelReply?.botId === xena.id)).toBe(false);
+      f.evidence("broadcast-held-default", { room: await f.room(pair.id) });
+    } finally {
+      await f.close();
+    }
+  }, 90_000);
+
+  it("says so when every member passes, tolerating decorated skip markers", async () => {
+    const f = await launch();
+    try {
+      const xena = await f.newBot("Xena");
+      const yuri = await f.newBot("Yuri");
+      const pair = await f.newRoom("Broadcast all pass", [xena, yuri], "broadcast");
+      f.play(xena.id, "happy", { FAKE_CLAUDE_REPLIES: JSON.stringify(["`[skip]` 这条不是给我的"]) });
+      f.play(yuri.id, "happy", { FAKE_CLAUDE_REPLIES: JSON.stringify(["看过之后我决定 [SKIP]。"]) });
+      await f.send(pair, "This one is for neither of you");
+      await f.idle(pair);
+      const messages = await f.messages(pair.threadId);
+      expect(messages.some((message) => message.role === "bot" && message.kind === "text" && (message.text ?? "").trim() !== "")).toBe(false);
+      expect(messages.some((message) => message.from?.botId === xena.id && message.tool?.ok === true && (message.tool.name ?? "").includes("passed"))).toBe(true);
+      expect(messages.some((message) => message.from?.botId === yuri.id && message.tool?.ok === true && (message.tool.name ?? "").includes("passed"))).toBe(true);
+      expect(messages.some((message) => message.tool?.ok === true && (message.tool.name ?? "").includes("Every member read this message and passed"))).toBe(true);
+      expect(messages.some((message) => message.tool?.ok === false)).toBe(false);
+      f.evidence("broadcast-all-pass", { room: await f.room(pair.id), messages });
+    } finally {
+      await f.close();
+    }
+  }, 90_000);
+
   it("shows one member's provider failure while another member completes", async () => {
     const f = await launch();
     try {

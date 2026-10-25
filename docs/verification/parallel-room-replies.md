@@ -40,7 +40,13 @@ told to judge first whether the message is theirs to handle; a member that
 passes replies with exactly `[skip]` and nothing else, and the room folds its
 lane away quietly — the mirrored reply text is cleared, the lane's status line
 reads "read it and passed", and nothing is reported as failed. A member that
-answers contributes its reply exactly as a parallel round does.
+answers contributes its reply exactly as a parallel round does. The pass is
+recognized however the model decorated the marker (case, fences, or a line
+that opens or closes with it), a lane that might still be only the marker
+holds its mirror empty so a pass never flashes, an unaddressed or
+held-blocked dispatch still reaches every other member, a follow-up in a
+member's details stays with that member alone, and a round nobody takes ends
+with one line saying every member passed.
 
 
 ## Verification

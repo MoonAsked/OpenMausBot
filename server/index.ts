@@ -11473,7 +11473,7 @@ function startGroupTurn(
   const autoRoute = autoCandidate && !goalCoordinator && routableMembers.length > 1 &&
     roomResponders(text, availableMembers, { kind: "mentions" }).length === 0;
 
-  if (!responders.length && !goalCoordinator && !autoRoute) {
+  if (!responders.length && !goalCoordinator && !autoRoute && (group.responseMode !== "broadcast" || !availableMembers.length)) {
     const defaultArchivedId = group.defaultResponder.kind === "member" ? group.defaultResponder.botId : undefined;
     const defaultArchived = archived.find((member) => member.id === defaultArchivedId);
     let unavailableMessage: string | undefined;
@@ -11504,7 +11504,7 @@ function startGroupTurn(
         .catch(() => undefined);
     }
   };
-  if (!autoRoute) startTitle(goalCoordinator ?? responders[0]!);
+  if (!autoRoute && responders[0]) startTitle(goalCoordinator ?? responders[0]!);
 
   const operation = beginGroupTurnOperation(
     groupId,
@@ -11583,7 +11583,7 @@ function startGroupTurn(
         for (const responder of round) operation.botIds.add(responder.id);
         if (round[0]) startTitle(round[0]);
       }
-      if (!group.dm && group.responseMode !== "sequential" && (round.length > 1 || group.responseMode === "broadcast")) {
+      if (!group.dm && !parallelReply && group.responseMode !== "sequential" && (round.length > 1 || group.responseMode === "broadcast")) {
         await parallelReplies.runRound(groupId, threadId, round, operation, message, routedBy);
         return;
       }

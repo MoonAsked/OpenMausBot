@@ -11,6 +11,18 @@ export const PARALLEL_REPLY_RESTARTED = "Independent reply interrupted by an Ope
 /** A broadcast-mode member that decides the message is not theirs replies with exactly this and nothing else. */
 export const BROADCAST_SKIP_MARKER = "[skip]";
 
+/** A pass however the model decorated it: fences and case aside, a line that opens with the marker, or a closing line that ends with it. */
+function saysSkip(text: string): boolean {
+  const lines = text
+    .replace(/```[a-z]*\n?/gi, "").replace(/`/g, "")
+    .trim().toLowerCase().split("\n")
+    .map(line => line.replace(/^[\s"'“”‘’.,;:!?.…\-–—_]+/, "").trim())
+    .filter(Boolean);
+  if (!lines.length) return false;
+  const last = lines[lines.length - 1]!.replace(/[\s"'“”‘’.,;:!?.…。,!?]+$/, "");
+  return lines.some(line => line.startsWith(BROADCAST_SKIP_MARKER)) || last.endsWith(BROADCAST_SKIP_MARKER);
+}
+
 const BROADCAST_INSTRUCTIONS = `You are answering independently alongside other room members in broadcast mode: every member receives every message. Use the supplied conversation snapshot. Do not wait for other members' answers or summon them with mentions; the person will receive each member's answer in the original conversation. Judge first whether the message needs you: if it is not yours to handle — it names another member, or it is another member's kind of work — reply with exactly ${BROADCAST_SKIP_MARKER} and nothing else, with no tool calls, and you will stay silent in the room. Otherwise answer it as you normally would.`;
 
 export function settleInterruptedParallelReplies(store: Pick<Store, "groups" | "messagesFor" | "patchMessage">): Array<{ groupId: string; threadId: string }> {
@@ -189,7 +201,8 @@ export function createParallelReplies<T extends ParallelOperation>(deps: Paralle
     if (!group || operation.cancelled) return;
     // Broadcast mode: addressing and routing stand aside — every member that is not archived or held reads the message and decides for itself whether to answer.
     const isBroadcast = group.responseMode === "broadcast";
-    if (isBroadcast) {
+    // A member-details follow-up stays with that member alone: broadcast expands only the room's own conversation threads.
+    if (isBroadcast && !store.groupTaskByThread(groupId, threadId)?.parallelReply) {
       const roster = group.memberIds
         .map(id => store.bot(id))
         .filter((bot): bot is BotRecord => bot !== null && !bot.hidden && !group.holds?.[bot.id]);
@@ -248,7 +261,9 @@ export function createParallelReplies<T extends ParallelOperation>(deps: Paralle
       if (current) broadcast({ kind: "group", group: deps.publicGroupState(current) });
     };
     publish();
-    await Promise.allSettled(prepared.map(async (lane) => {
+    const outcomes: Array<"passed" | "answered" | "other"> = prepared.map(() => "other" as const);
+    await Promise.allSettled(prepared.map(async (lane, index) => {
+      const outcome: { lane: "passed" | "answered" | "other" } = { lane: "other" };
       const result: { replyText?: string; outcome?: MemberTurnOutcome; stopReason?: string | null } = {};
       let failure: string | undefined;
       let childFinished = false;
@@ -257,6 +272,8 @@ export function createParallelReplies<T extends ParallelOperation>(deps: Paralle
       let flushTimer: ReturnType<typeof setTimeout> | undefined;
       let lastText = "";
       let lastAttachments = "";
+      let shownText = "";
+      let shownAttachments = "";
       let lastProgress = "";
       const cancelled = () => operation.cancelled || lane.operation.cancelled;
       const mirror = () => {
@@ -267,10 +284,16 @@ export function createParallelReplies<T extends ParallelOperation>(deps: Paralle
         const text = [...replies.map(message => message.text ?? "").filter(Boolean), delta].filter(Boolean).join("\n\n");
         const attachments = replies.flatMap(message => message.attachments ?? []);
         const attachmentKey = JSON.stringify(attachments);
-        if (text === lastText && attachmentKey === lastAttachments) return;
         lastText = text;
         lastAttachments = attachmentKey;
-        store.patchMessage(threadId, lane.replyId, { text, ...(attachments.length ? { attachments } : {}) });
+        // A broadcast lane that could still turn out to be only the skip marker keeps the room mirror empty, so a pass never flashes.
+        const probe = text.replace(/`/g, "").toLowerCase();
+        const held = isBroadcast && (!probe || "[skip]".startsWith(probe) || (probe.startsWith("[skip") && probe.length <= 64));
+        const next = held ? "" : text;
+        if (next === shownText && attachmentKey === shownAttachments) return;
+        shownText = next;
+        shownAttachments = attachmentKey;
+        store.patchMessage(threadId, lane.replyId, { text: next, ...(attachments.length ? { attachments } : {}) });
       };
       const progress = () => {
         const speaker = deps.speakersOf(lane.threadId);
@@ -340,8 +363,11 @@ export function createParallelReplies<T extends ParallelOperation>(deps: Paralle
         if (flushTimer) clearTimeout(flushTimer);
         delta = "";
         mirror();
-        // A broadcast member that answered with exactly the skip marker chose not to speak: fold its lane away quietly instead of reporting it.
-        const passed = isBroadcast && !cancelled() && !failure && lastText.trim() === BROADCAST_SKIP_MARKER && lastAttachments === "[]";
+        // A broadcast member that settled on the skip marker — however decorated — or with no reply at all chose not to speak: fold its lane away quietly instead of reporting it.
+        const settled = !cancelled() && !failure && (root ? root.status === "completed" : result.outcome === "settled");
+        const passed = isBroadcast && settled && lastAttachments === "[]" && (saysSkip(lastText) || !lastText.trim());
+        outcome.lane = passed ? "passed" : settled && (lastText.trim() || lastAttachments !== "[]") ? "answered" : "other";
+        outcomes[index] = outcome.lane;
         if (passed) {
           store.patchMessage(threadId, lane.replyId, { text: "" });
           if (store.groupTaskByThread(groupId, threadId)) {
@@ -362,6 +388,13 @@ export function createParallelReplies<T extends ParallelOperation>(deps: Paralle
         publish();
       }
     }));
+    if (isBroadcast && outcomes.length && outcomes.every(outcome => outcome === "passed")) {
+      store.appendMessage(threadId, {
+        role: "bot",
+        kind: "activity",
+        tool: { name: "Every member read this message and passed — mention a member to pick one, or switch the reply mode.", ok: true },
+      });
+    }
   }
 
   return { respondersOf, waitForChatRoomMember, runRound };
