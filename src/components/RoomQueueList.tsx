@@ -1,8 +1,36 @@
 import { t } from "@/lib/i18n";
 import { roomQueueLabel, roomThreadQueue } from "@/lib/room-threads";
-import type { Bot, Group, Message } from "@/state/store";
+import { openThread, useStore, type Bot, type Group, type Message } from "@/state/store";
+import { useShowThreads } from "@/lib/thread-preferences";
 
 const nameIn = (members: Bot[]) => (botId: string) => members.find((member) => member.id === botId)?.name;
+
+export function RoomParallelReplies({ group, members }: { group: Group; members: Bot[] }) {
+  const { state, dispatch } = useStore();
+  const showThreads = useShowThreads();
+  const responders = group.tasks?.find((task) => task.threadId === group.threadId)?.activeResponders ?? group.activeResponders ?? [];
+  if (!responders.length) return null;
+  const nameOf = nameIn(members);
+  return (
+    <ul data-testid="room-parallel-replies" className="flex flex-col gap-1 pl-12 text-[12.5px] text-ink-secondary">
+      {responders.map((entry) => (
+        <li key={`${entry.botId}:${entry.threadId}`}>
+          <button
+            type="button"
+            className="cursor-pointer text-left hover:text-ink hover:underline"
+            onClick={() => openThread(dispatch, { botId: group.id, threadId: entry.threadId }, state, showThreads)}
+            title={t("room.responseMode.openDetails")}
+          >
+            {t("room.responseMode.memberStatus", {
+              name: nameOf(entry.botId) ?? t("sidebar.preview.aBot"),
+              status: t(entry.state === "waiting-on-you" ? "room.responseMode.waiting" : entry.state === "queued" ? "room.responseMode.queued" : "room.responseMode.running"),
+            })}
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 export function RoomQueueList({ group, members }: { group: Group; members: Bot[] }) {
   const queued = roomThreadQueue(group, group.threadId);

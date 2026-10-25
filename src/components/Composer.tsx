@@ -140,7 +140,7 @@ export function Composer({
   const remoteClient = window.ogb?.remoteClient?.active === true;
   const threadId = group?.threadId ?? bot?.threadId ?? "";
   const currentGroupTask = group?.tasks?.find((task) => task.threadId === threadId);
-  const groupBusyBotId = currentGroupTask?.busyBotId ?? (currentGroupTask?.working ? group?.busyBotId : (group?.threadId === threadId ? group?.busyBotId : null));
+  const groupBusyBotId = (currentGroupTask?.activeResponders ?? group?.activeResponders)?.length ? null : currentGroupTask?.busyBotId ?? (currentGroupTask?.working ? group?.busyBotId : (group?.threadId === threadId ? group?.busyBotId : null));
   const groupWorking = group ? openTaskWorking(group) : false;
   const busy = group ? Boolean(groupWorking || groupBusyBotId) : Boolean(bot?.busy);
   const steerInstanceId = group
@@ -402,7 +402,7 @@ export function Composer({
 
   const pendingCount = (state.pendingQueued[threadId] ?? []).length;
   const queuedMessages = state.pendingQueued[threadId] ?? [];
-  const canSteerQueued = composerCanSteerQueuedMessages(
+  const canSteerQueued = !(currentGroupTask?.activeResponders ?? group?.activeResponders)?.length && composerCanSteerQueuedMessages(
     busy,
     locked,
     pendingCount,
