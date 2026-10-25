@@ -31,6 +31,18 @@ After a restart, incomplete parallel replies are marked interrupted and are
 not automatically replayed. Saved text and details remain available for review
 before continuing. The group keeps its chosen response mode.
 
+## Broadcast mode (every member reads, each answers for itself)
+
+A third reply mode, `broadcast`, extends parallel rounds: addressing and
+responder routing stand aside, and every member that is not archived or held
+receives every message in its own lane, concurrently. Each member's turn is
+told to judge first whether the message is theirs to handle; a member that
+passes replies with exactly `[skip]` and nothing else, and the room folds its
+lane away quietly — the mirrored reply text is cleared, the lane's status line
+reads "read it and passed", and nothing is reported as failed. A member that
+answers contributes its reply exactly as a parallel round does.
+
+
 ## Verification
 
 Follow `docs/verification/README.md`; all workflow mutations use disposable

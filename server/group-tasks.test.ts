@@ -37,6 +37,18 @@ describe("channel tasks", () => {
     expect(new Store(() => ({ instanceId: "claude", model: "m" })).group(channel.id)?.responseMode).toBe("sequential");
   });
 
+  it("keeps broadcast as a room mode across restarts while DM chats never leave sequential", async () => {
+    const { store, Store } = await freshStore();
+    const bot = store.createBot();
+    const channel = store.createGroup("Product", [bot.id]);
+    store.patchGroup(channel.id, { responseMode: "broadcast" });
+    expect(store.group(channel.id)?.responseMode).toBe("broadcast");
+    expect(new Store(() => ({ instanceId: "claude", model: "m" })).group(channel.id)?.responseMode).toBe("broadcast");
+    const direct = store.createGroup("Direct", [bot.id], true);
+    store.patchGroup(direct.id, { responseMode: "broadcast" });
+    expect(store.group(direct.id)?.responseMode).toBe("sequential");
+  });
+
   it("retains parallel reply ownership but does not persist running member state", async () => {
     const { store, Store } = await freshStore();
     const bot = store.createBot();

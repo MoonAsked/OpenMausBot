@@ -8,6 +8,11 @@ import { GROUP_CONTEXT_MESSAGES, isRoomContextMessage } from "./room-transcript.
 
 export const PARALLEL_REPLY_RESTARTED = "Independent reply interrupted by an OpenMausBot restart. Review the saved reply and details before continuing.";
 
+/** A broadcast-mode member that decides the message is not theirs replies with exactly this and nothing else. */
+export const BROADCAST_SKIP_MARKER = "[skip]";
+
+const BROADCAST_INSTRUCTIONS = `You are answering independently alongside other room members in broadcast mode: every member receives every message. Use the supplied conversation snapshot. Do not wait for other members' answers or summon them with mentions; the person will receive each member's answer in the original conversation. Judge first whether the message needs you: if it is not yours to handle — it names another member, or it is another member's kind of work — reply with exactly ${BROADCAST_SKIP_MARKER} and nothing else, with no tool calls, and you will stay silent in the room. Otherwise answer it as you normally would.`;
+
 export function settleInterruptedParallelReplies(store: Pick<Store, "groups" | "messagesFor" | "patchMessage">): Array<{ groupId: string; threadId: string }> {
   const interrupted: Array<{ groupId: string; threadId: string }> = [];
   for (const group of store.groups) {
@@ -32,7 +37,8 @@ export function settleInterruptedParallelReplies(store: Pick<Store, "groups" | "
 export function migrateParallelGroupState(group: GroupRecord): boolean {
   delete group.activeResponders;
   for (const task of group.tasks ?? []) delete task.activeResponders;
-  const responseMode = !group.dm && group.responseMode === "parallel" ? "parallel" : "sequential";
+  const responseMode = !group.dm && (group.responseMode === "parallel" || group.responseMode === "broadcast")
+    ? group.responseMode : "sequential";
   if (group.responseMode === responseMode) return false;
   group.responseMode = responseMode;
   return true;
@@ -181,6 +187,14 @@ export function createParallelReplies<T extends ParallelOperation>(deps: Paralle
   ): Promise<void> {
     const group = store.group(groupId);
     if (!group || operation.cancelled) return;
+    // Broadcast mode: addressing and routing stand aside — every member that is not archived or held reads the message and decides for itself whether to answer.
+    const isBroadcast = group.responseMode === "broadcast";
+    if (isBroadcast) {
+      const roster = group.memberIds
+        .map(id => store.bot(id))
+        .filter((bot): bot is BotRecord => bot !== null && !bot.hidden && !group.holds?.[bot.id]);
+      if (roster.length) responders = roster;
+    }
     const history = store.messagesFor(threadId);
     const sourceIndex = history.findIndex(message => message.id === source.id);
     const contextMessages = structuredClone(history.filter((message, index) =>
@@ -296,7 +310,8 @@ export function createParallelReplies<T extends ParallelOperation>(deps: Paralle
         }
         await deps.runMemberTurn({ groupId, threadId: lane.threadId, botId: lane.bot.id,
           onError: message => { failure = message; }, cancelled, operation: lane.operation,
-          systemInstructions: "You are answering independently alongside other room members. Use the supplied conversation snapshot. Do not wait for their answers or summon other members with mentions; the person will receive each member's answer in the original conversation.",
+          systemInstructions: isBroadcast ? BROADCAST_INSTRUCTIONS
+            : "You are answering independently alongside other room members. Use the supplied conversation snapshot. Do not wait for their answers or summon other members with mentions; the person will receive each member's answer in the original conversation.",
           onClaimed: progress, contextMessages, contextUserName, result,
         });
         deps.finishGroupTurnOperation(groupId, lane.operation);
@@ -325,10 +340,19 @@ export function createParallelReplies<T extends ParallelOperation>(deps: Paralle
         if (flushTimer) clearTimeout(flushTimer);
         delta = "";
         mirror();
-        const ok = !cancelled() && !failure && (root ? root.status === "completed" : result.outcome === "settled") && Boolean(lastText.trim() || lastAttachments !== "[]");
-        const detail = cancelled() ? "stopped" : ok ? "reply complete"
-          : failure || result.stopReason || (result.outcome === "settled" ? "finished without a reply — open details" : result.outcome || "reply did not run");
-        if (store.groupTaskByThread(groupId, threadId)) {
+        // A broadcast member that answered with exactly the skip marker chose not to speak: fold its lane away quietly instead of reporting it.
+        const passed = isBroadcast && !cancelled() && !failure && lastText.trim() === BROADCAST_SKIP_MARKER && lastAttachments === "[]";
+        if (passed) {
+          store.patchMessage(threadId, lane.replyId, { text: "" });
+          if (store.groupTaskByThread(groupId, threadId)) {
+            store.patchMessage(threadId, lane.progressId, {
+              tool: { name: `${lane.bot.name} — read it and passed (not theirs to answer)`, ok: true },
+            });
+          }
+        } else if (store.groupTaskByThread(groupId, threadId)) {
+          const ok = !cancelled() && !failure && (root ? root.status === "completed" : result.outcome === "settled") && Boolean(lastText.trim() || lastAttachments !== "[]");
+          const detail = cancelled() ? "stopped" : ok ? "reply complete"
+            : failure || result.stopReason || (result.outcome === "settled" ? "finished without a reply — open details" : result.outcome || "reply did not run");
           store.patchMessage(threadId, lane.progressId, {
             tool: { name: `${lane.bot.name} — ${redactSecretsInText(detail).slice(0, 500)}`, ok },
           });

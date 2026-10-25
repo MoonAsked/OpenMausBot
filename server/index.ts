@@ -11381,7 +11381,7 @@ function startGroupTurn(
     throw Object.assign(new Error("the selected goal coordinator is not an active room member"), { status: 409 });
   }
   // Read the room before this message is appended just below.
-  const autoCandidate = !group.dm && !store.groupTaskByThread(groupId, threadId)?.parallelReply && channelMode === "chat" && group.defaultResponder.kind === "auto" &&
+  const autoCandidate = !group.dm && group.responseMode !== "broadcast" && !store.groupTaskByThread(groupId, threadId)?.parallelReply && channelMode === "chat" && group.defaultResponder.kind === "auto" &&
     deciderReady(cfg, "roomRouting");
   const historyBeforeSend = autoCandidate
     ? (() => {
@@ -11583,7 +11583,7 @@ function startGroupTurn(
         for (const responder of round) operation.botIds.add(responder.id);
         if (round[0]) startTitle(round[0]);
       }
-      if (!group.dm && group.responseMode === "parallel" && round.length > 1) {
+      if (!group.dm && group.responseMode !== "sequential" && (round.length > 1 || group.responseMode === "broadcast")) {
         await parallelReplies.runRound(groupId, threadId, round, operation, message, routedBy);
         return;
       }

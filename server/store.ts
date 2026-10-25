@@ -884,7 +884,7 @@ export class Store {
       defaultResponder: dm
         ? { kind: "mentions" }
         : normalizeGroupDefaultResponder(setup?.defaultResponder, memberIds, false),
-      responseMode: !dm && setup?.responseMode === "parallel" ? "parallel" : "sequential",
+      responseMode: !dm && (setup?.responseMode === "parallel" || setup?.responseMode === "broadcast") ? setup.responseMode : "sequential",
       bulletin: setup?.bulletin ?? "",
       unread: false,
       createdAt,
@@ -931,7 +931,7 @@ export class Store {
         if (active) active.pinnedMessageId = stored.pinnedMessageId;
       }
       group.defaultResponder = normalizeGroupDefaultResponder(group.defaultResponder, group.memberIds, Boolean(group.dm));
-      group.responseMode = !group.dm && group.responseMode === "parallel" ? "parallel" : "sequential";
+      group.responseMode = !group.dm && (group.responseMode === "parallel" || group.responseMode === "broadcast") ? group.responseMode : "sequential";
       if (Object.prototype.hasOwnProperty.call(stored, "memberIds")) pruneRoomHolds(group);
     });
     this.emit({ type: "group", groupId: group.id });

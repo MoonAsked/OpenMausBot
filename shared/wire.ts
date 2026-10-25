@@ -782,7 +782,8 @@ export type GroupDefaultResponder =
   | { kind: "mentions" }
   | { kind: "auto"; fallbackBotId?: string };
 
-export type GroupResponseMode = "sequential" | "parallel";
+/** `broadcast`: every member reads every message and runs alongside the others; a member that decides the message is not theirs replies with the skip marker and stays silent in the room. */
+export type GroupResponseMode = "sequential" | "parallel" | "broadcast";
 
 export interface GroupActiveResponder {
   botId: string;

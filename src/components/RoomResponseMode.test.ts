@@ -42,6 +42,20 @@ describe("reply mode", () => {
     expect(fixture.dispatch).toHaveBeenCalledWith({ type: "patchGroup", groupId: "room", patch: { responseMode: "parallel" } });
   });
 
+  it("offers broadcast and saves the switch, explaining the self-select rule", () => {
+    const room = group();
+    const markup = renderToStaticMarkup(createElement(RoomResponseModeSelect, { group: room }));
+    expect(markup).toContain('<option value="broadcast">Broadcast replies</option>');
+    const select = nodes(RoomResponseModeSelect({ group: room })).find((node) => node.type === Select)!;
+    (select.props.onChange as (event: { target: { value: string } }) => void)({ target: { value: "broadcast" } });
+    expect(fixture.dispatch).toHaveBeenCalledWith({ type: "patchGroup", groupId: "room", patch: { responseMode: "broadcast" } });
+    const detail = renderToStaticMarkup(createElement(RoomResponseModeSelect, { group: group({ responseMode: "broadcast" }) }));
+    expect(detail).toContain("stays silent in the room");
+    setLocale("zh");
+    const chinese = renderToStaticMarkup(createElement(RoomResponseModeSelect, { group: group({ responseMode: "broadcast" }) }));
+    expect(chinese).toContain("广播自选回复");
+  });
+
   it("explains independent context and prevents mode changes during an active round", () => {
     const markup = renderToStaticMarkup(createElement(RoomResponseModeSelect, { group: group({ responseMode: "parallel", working: true }) }));
     expect(markup).toContain("same starting context");

@@ -18,7 +18,7 @@ export interface GroupRouteDeps {
 }
 
 export function checkedGroupResponseMode(value: unknown): GroupResponseMode | null {
-  return value === "sequential" || value === "parallel" ? value : null;
+  return value === "sequential" || value === "parallel" || value === "broadcast" ? value : null;
 }
 
 /** A room's default responder from a request body; null when it is not one, or names a bot outside the room. */
@@ -83,7 +83,7 @@ export function createGroupRoutes(deps: GroupRouteDeps): RouteHandler {
         const responder = checkedGroupResponder(body.defaultResponder, group.memberIds);
         if (!responder) return json(res, 400, { error: "invalid default responder" });
         const responseMode = checkedGroupResponseMode(body.responseMode === undefined ? "sequential" : body.responseMode);
-        if (!responseMode) return json(res, 400, { error: "responseMode must be sequential or parallel" });
+        if (!responseMode) return json(res, 400, { error: "responseMode must be sequential, parallel or broadcast" });
         patch.cwd = checked.cwd ?? undefined;
         patch.defaultResponder = responder;
         patch.responseMode = responseMode;

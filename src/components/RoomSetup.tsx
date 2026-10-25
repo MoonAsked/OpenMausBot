@@ -345,13 +345,14 @@ export function RoomSetup({ group, members }: { group: Group; members: Bot[] }) 
             className="mt-2 w-full"
             value={responseMode}
             disabled={saving}
-            onChange={(event) => setResponseMode(event.target.value === "parallel" ? "parallel" : "sequential")}
+            onChange={(event) => setResponseMode(event.target.value === "parallel" || event.target.value === "broadcast" ? event.target.value : "sequential")}
           >
             <option value="sequential">{t("room.responseMode.sequential")}</option>
             <option value="parallel">{t("room.responseMode.parallel")}</option>
+            <option value="broadcast">{t("room.responseMode.broadcast")}</option>
           </Select>
           <span className="mt-1 block text-[12px] text-ink-secondary">
-            {t(responseMode === "parallel" ? "room.responseMode.parallelDetail" : "room.responseMode.sequentialDetail")}
+            {t(`room.responseMode.${responseMode}Detail`)}
           </span>
         </label>
 

@@ -30,17 +30,22 @@ export function RoomResponseModeSelect({ group }: { group: Group }) {
       size="sm"
       className="shrink-0 max-w-[170px]"
       aria-label={t("room.responseMode.label")}
-      title={t(group.responseMode === "parallel" ? "room.responseMode.parallelDetail" : "room.responseMode.sequentialDetail")}
+      title={t(`room.responseMode.${group.responseMode ?? "sequential"}Detail`)}
       value={group.responseMode ?? "sequential"}
       disabled={Boolean(group.working)}
       onChange={(event) => dispatch({
         type: "patchGroup",
         groupId: group.id,
-        patch: { responseMode: event.target.value === "parallel" ? "parallel" : "sequential" },
+        patch: {
+          responseMode: event.target.value === "parallel" || event.target.value === "broadcast"
+            ? event.target.value
+            : "sequential",
+        },
       })}
     >
       <option value="sequential">{t("room.responseMode.sequential")}</option>
       <option value="parallel">{t("room.responseMode.parallel")}</option>
+      <option value="broadcast">{t("room.responseMode.broadcast")}</option>
     </Select>
   );
 }
